@@ -22,6 +22,8 @@ import {
   DASHBOARD_LATENCY_WINDOW_HOURS,
   DASHBOARD_LATENCY_WINDOW_POINTS
 } from './utils/config.js';
+import { getNextServerHistoryPartitionId } from './database/indexOptimization.js';
+import { clearServersListCache } from './utils/cache.js';
 // Durable Objects: 实时指标广播
 // 显式 import + extends，确保 wrangler 静态分析器能在入口文件直接识别此 DO 类
 import { MetricsBroadcaster as _MetricsBroadcaster }
@@ -177,8 +179,127 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
     ? data.map(omitNullLossProbeFields)
     : data;
   setMetricsHistoryCache(id, clampedHours, columns, sanitizedData, longHistoryPoints);
-  
+
   return createSuccessResponse(sanitizedData, { 'X-Cache': 'MISS' });
+}
+
+async function handleAutoJoin(request, env) {
+  const authHeader = request.headers.get('Authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  if (!token || token !== env.API_SECRET) {
+    return createUnauthorizedResponse('invalidCredentials');
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch (_) {}
+
+  const name = String(body.name || '').trim() || 'New Server';
+  const group = String(body.group || 'Default').trim();
+  const region = String(body.region || '').trim() || 'id';
+
+  let server = await env.DB.prepare('SELECT id FROM servers WHERE name = ?').bind(name).first();
+  if (server && server.id) {
+    return createSuccessResponse({ success: true, id: server.id, name, existed: true });
+  }
+
+  const id = crypto.randomUUID();
+  const { max_order } = await env.DB.prepare('SELECT COALESCE(MAX(sort_order), -1) as max_order FROM servers').first();
+  const sortOrder = (max_order || 0) + 1;
+  const historyPartitionId = await getNextServerHistoryPartitionId(env.DB);
+
+  await env.DB.prepare(`
+    INSERT INTO servers
+    (id, name, server_group, region, "interface", sort_order, history_partition_id, timestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(id, name, group, region, '', sortOrder, historyPartitionId, Date.now()).run();
+
+  clearServersListCache();
+
+  return createSuccessResponse({ success: true, id, name, existed: false });
+}
+
+function handleJoinScript(request, env, url) {
+  const secretParam = url.searchParams.get('s') || url.searchParams.get('secret') || '';
+  const nameParam = url.searchParams.get('name') || '';
+  const host = url.origin;
+
+  const script = `#!/bin/sh
+set -e
+
+# CF-Server-Monitor One-Click Connect Script
+SERVER_URL="${host}"
+SECRET="${secretParam}"
+NAME="${nameParam}"
+
+if [ -n "$1" ]; then
+  if [ -z "$SECRET" ] && [ \${#1} -ge 24 ]; then
+    SECRET="$1"
+    NAME="$2"
+  else
+    NAME="$1"
+  fi
+fi
+
+if [ -z "$NAME" ]; then
+  NAME="$(hostname)"
+fi
+
+if [ -z "$SECRET" ]; then
+  printf "Masukkan API_SECRET: "
+  read -r SECRET
+fi
+
+if [ -z "$SECRET" ]; then
+  echo "[ERROR] API_SECRET tidak boleh kosong!"
+  exit 1
+fi
+
+echo "==========================================="
+echo "  CF-Server-Monitor Auto-Connect"
+echo "  Server Target : $NAME"
+echo "  Dashboard URL : $SERVER_URL"
+echo "==========================================="
+
+echo "==> Mendaftarkan server '$NAME' ke dashboard..."
+RESP=$(curl -s -X POST "$SERVER_URL/api/auto-join" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer $SECRET" \\
+  -d "{\\"name\\":\\"$NAME\\"}")
+
+SERVER_ID=$(echo "$RESP" | grep -o '"id":"[^"]*' | head -n1 | cut -d'"' -f4)
+
+if [ -z "$SERVER_ID" ]; then
+  echo "[ERROR] Gagal mendaftarkan server ke dashboard: $RESP"
+  exit 1
+fi
+
+echo "[OK] ID Server: $SERVER_ID"
+
+if [ "$(id -u)" -ne 0 ] && command -v loginctl >/dev/null 2>&1; then
+  echo "==> Memastikan lingering systemd aktif..."
+  loginctl enable-linger "$USER" 2>/dev/null || true
+fi
+
+echo "==> Mengunduh dan memasang cf-probe..."
+curl -fsSL 'https://raw.githubusercontent.com/huilang-me/cfsm-agent/main/install.sh' | sh -s -- install -id="$SERVER_ID" -secret="$SECRET" -url="$SERVER_URL/update" -auto_update=0
+
+echo ""
+echo "==========================================="
+echo "  [SUCCESS] $NAME BERHASIL TERHUBUNG!"
+echo "  Status & metrik live dapat dilihat di:"
+echo "  $SERVER_URL/"
+echo "==========================================="
+`;
+
+  return new Response(script, {
+    headers: {
+      'Content-Type': 'text/x-shellscript; charset=utf-8',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Access-Control-Allow-Origin': '*'
+    }
+  });
 }
 
 export default {
@@ -278,6 +399,9 @@ export default {
     }
 
     const routes = [
+      { method: 'GET', path: '/join.sh', handler: () => handleJoinScript(request, env, url) },
+      { method: 'GET', path: '/join', handler: () => handleJoinScript(request, env, url) },
+      { method: 'POST', path: '/api/auto-join', handler: () => handleAutoJoin(request, env) },
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {
