@@ -132,6 +132,8 @@
       </div>
 
       <div class="form-group">
+        <label class="form-label font-bold mb-2">{{ trans.installCommand }}</label>
+        <p class="install-command-security-note" role="note">{{ trans.installCommandSecurityWarning }}</p>
         <div class="cmd-output-wrapper" :class="{ copied: copiedCmd }">
           <span class="cmd-prompt">{{ targetOs === 'windows' ? 'PS' : '$' }}</span>
           <pre class="cmd-output">{{ installCommand }}</pre>

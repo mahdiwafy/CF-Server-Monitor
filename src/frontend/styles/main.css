@@ -3363,8 +3363,14 @@ body::before {
     color: var(--accent-green);
 }
 
+.install-command-security-note {
+    color: var(--accent-yellow);
+    font-size: 12px;
+    margin: -4px 0 8px;
+}
+
 .cmd-output-wrapper {
-    display: none;
+    display: flex;
     align-items: flex-start;
     gap: 4px;
     background: var(--input-bg);
